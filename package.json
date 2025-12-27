@@ -1,16 +1,12 @@
 {
-  "name": "stm-metro-realtime",
-  "version": "1.1.1",
-  "description": "Prochains métros STM (théorique via GTFS)",
+  "name": "stm-metro-theorique",
+  "version": "1.0.0",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
-  "express": "^4.19.2",
-  "node-fetch": "^2.7.0",
-  "gtfs-realtime-bindings": "^1.1.1",
-  "unzipper": "^0.10.14",
-  "csv-parse": "^5.4.0"
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "unzipper": "^0.10.14",
+    "csv-parser": "^3.0.0"
   }
 }
