@@ -1,80 +1,75 @@
 const express = require("express");
 const fetch = require("node-fetch");
-const AdmZip = require("adm-zip");
-const { parse } = require("csv-parse/sync");
+const unzipper = require("unzipper");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// GTFS officiel STM (planifié)
-const GTFS_URL = "http://www.stm.info/sites/default/files/gtfs/gtfs_stm.zip";
+// GTFS STM officiel (statique)
+const GTFS_ZIP_URL = "http://www.stm.info/sites/default/files/gtfs/gtfs_stm.zip"; // :contentReference[oaicite:2]{index=2}
 
-// On vise la ligne jaune (route_id "4").
-// Dans le GTFS STM, le métro est surtout décrit par fréquences (frequencies.txt).
-let frequencies = []; // rows of frequencies.txt
-let trips = [];       // rows of trips.txt
-let routes = [];      // rows of routes.txt
-let calendar = [];    // rows of calendar.txt
-let calendarDates = []; // rows of calendar_dates.txt
+// Dossier de travail sur Render
+const GTFS_DIR = "/tmp/gtfs_stm";
 
-function hhmmssToSec(t) {
-  const [h, m, s] = t.split(":").map(Number);
-  return h * 3600 + m * 60 + s;
-}
-function secToMinCeil(seconds) {
-  return Math.max(0, Math.ceil(seconds / 60));
-}
-function todayYYYYMMDD() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}${m}${day}`;
-}
-function weekdayIndex() {
-  // JS: 0 Sunday .. 6 Saturday, GTFS: monday..sunday
-  const js = new Date().getDay();
-  return js === 0 ? "sunday" : ["monday","tuesday","wednesday","thursday","friday","saturday"][js-1];
+// Helpers CSV
+function parseCSV(filePath) {
+  const txt = fs.readFileSync(filePath, "utf8");
+  const lines = txt.split(/\r?\n/).filter(Boolean);
+  const headers = lines.shift().split(",");
+  return lines.map(line => {
+    // simple split CSV (ok for STM GTFS in practice for these files)
+    const cols = line.split(",");
+    const obj = {};
+    headers.forEach((h, i) => (obj[h] = cols[i]));
+    return obj;
+  });
 }
 
-function isServiceActive(service_id) {
-  const today = todayYYYYMMDD();
-  const wd = weekdayIndex();
-
-  // Exceptions first (calendar_dates)
-  const ex = calendarDates.find(r => r.service_id === service_id && r.date === today);
-  if (ex) {
-    // exception_type: 1 = added, 2 = removed
-    return ex.exception_type === "1";
-  }
-
-  const c = calendar.find(r => r.service_id === service_id);
-  if (!c) return false;
-
-  if (today < c.start_date || today > c.end_date) return false;
-  return c[wd] === "1";
+function hmsToSeconds(hms) {
+  const [h, m, s] = hms.split(":").map(Number);
+  return (h * 3600) + (m * 60) + (s || 0);
 }
 
-async function loadGtfs() {
-  const resp = await fetch(GTFS_URL);
-  if (!resp.ok) throw new Error(`GTFS download failed: ${resp.status}`);
-  const buf = await resp.buffer();
+function secondsToMinRange(headwaySec) {
+  const m = Math.max(1, Math.round(headwaySec / 60));
+  return `0–${m} min`;
+}
 
-  const zip = new AdmZip(buf);
-  const getCsv = (name) => {
-    const entry = zip.getEntry(name);
-    if (!entry) return [];
-    const text = entry.getData().toString("utf8");
-    return parse(text, { columns: true, skip_empty_lines: true });
-  };
+// ---- GTFS load (download + unzip) ----
+let GTFS = null;
 
-  // fichiers principaux
-  routes = getCsv("routes.txt");
-  trips = getCsv("trips.txt");
-  frequencies = getCsv("frequencies.txt");
-  calendar = getCsv("calendar.txt");
-  calendarDates = getCsv("calendar_dates.txt");
+async function downloadAndUnzipGTFS() {
+  fs.mkdirSync(GTFS_DIR, { recursive: true });
 
+  const zipPath = path.join(GTFS_DIR, "gtfs_stm.zip");
+  const res = await fetch(GTFS_ZIP_URL);
+  if (!res.ok) throw new Error("Download GTFS failed: " + res.status);
+
+  const fileStream = fs.createWriteStream(zipPath);
+  await new Promise((resolve, reject) => {
+    res.body.pipe(fileStream);
+    res.body.on("error", reject);
+    fileStream.on("finish", resolve);
+  });
+
+  // unzip
+  await fs.createReadStream(zipPath)
+    .pipe(unzipper.Extract({ path: GTFS_DIR }))
+    .promise();
+
+  // Load only what we need
+  const routes = parseCSV(path.join(GTFS_DIR, "routes.txt"));
+  const trips = parseCSV(path.join(GTFS_DIR, "trips.txt"));
+  const frequencies = fs.existsSync(path.join(GTFS_DIR, "frequencies.txt"))
+    ? parseCSV(path.join(GTFS_DIR, "frequencies.txt"))
+    : [];
+  const calendar = fs.existsSync(path.join(GTFS_DIR, "calendar.txt"))
+    ? parseCSV(path.join(GTFS_DIR, "calendar.txt"))
+    : [];
+
+  GTFS = { routes, trips, frequencies, calendar };
   console.log("GTFS loaded:", {
     routes: routes.length,
     trips: trips.length,
@@ -82,104 +77,99 @@ async function loadGtfs() {
   });
 }
 
-// Retourne la meilleure fréquence planifiée pour route_id=4, maintenant
-function getHeadwaySecondsForYellowLineNow() {
+// Determine active service_id today (very simple)
+function getTodayServiceIds(calendar) {
+  // Render is UTC by default; set TZ in Render to America/Toronto (see step 2)
   const now = new Date();
-  const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  const yyyymmdd = `${y}${m}${d}`;
 
-  // trouver route_id "4"
-  const route = routes.find(r => String(r.route_id) === "4" || String(r.route_short_name) === "4");
-  if (!route) return null;
+  const weekday = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"][now.getDay()];
 
-  // trouver des trips de cette route
+  return calendar
+    .filter(r => r.start_date <= yyyymmdd && r.end_date >= yyyymmdd && r[weekday] === "1")
+    .map(r => r.service_id);
+}
+
+// Find headway for line 4 around now using frequencies.txt
+function getYellowLineHeadway(nowSec) {
+  if (!GTFS) throw new Error("GTFS not loaded yet");
+
+  const serviceIds = getTodayServiceIds(GTFS.calendar);
+
+  // route_id "4" (ligne jaune) — on prend les trips route_id=4 et service_id actif
   const tripIds = new Set(
-    trips
-      .filter(t => String(t.route_id) === String(route.route_id))
-      .filter(t => isServiceActive(t.service_id))
-      .map(t => String(t.trip_id))
+    GTFS.trips
+      .filter(t => t.route_id === "4" && serviceIds.includes(t.service_id))
+      .map(t => t.trip_id)
   );
 
-  if (tripIds.size === 0) return null;
-
-  // filter frequencies rows for those trip_ids and current time
-  const candidates = frequencies
-    .filter(f => tripIds.has(String(f.trip_id)))
+  // Find frequencies rows matching these trips and current time window
+  const matches = GTFS.frequencies
+    .filter(f => tripIds.has(f.trip_id))
     .map(f => ({
-      start: hhmmssToSec(f.start_time),
-      end: hhmmssToSec(f.end_time),
+      start: hmsToSeconds(f.start_time),
+      end: hmsToSeconds(f.end_time),
       headway: Number(f.headway_secs)
     }))
-    .filter(f => nowSec >= f.start && nowSec <= f.end)
-    .sort((a,b) => a.headway - b.headway);
+    .filter(f => nowSec >= f.start && nowSec <= f.end);
 
-  if (candidates.length === 0) return null;
-  return candidates[0].headway; // smallest headway (most frequent) at this time
+  if (!matches.length) return null;
+
+  // Use the smallest headway (best case)
+  matches.sort((a, b) => a.headway - b.headway);
+  return matches[0].headway;
 }
 
-// Calcule 2 prochains passages théoriques à partir de headway (fréquence)
-function computeNextTwoFromHeadway(headway) {
-  const now = new Date();
-  const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
-
-  const next1 = headway - (nowSec % headway);
-  const next2 = next1 + headway;
-
-  const fmt = (sec) => {
-    if (sec < 60) return "Arrive";
-    return `${secToMinCeil(sec)} min`;
-  };
-
-  return [fmt(next1), fmt(next2)];
-}
-
-// Endpoint texte pour raccourci iPhone
+// ---- endpoints ----
 app.get("/next", async (req, res) => {
   try {
-    const headway = getHeadwaySecondsForYellowLineNow();
-    if (!headway) return res.type("text").send("Données indisponibles\n—");
+    if (!GTFS) {
+      return res.status(503).type("text").send("Données indisponibles\n—");
+    }
 
-    const [a, b] = computeNextTwoFromHeadway(headway);
-    res.type("text").send(`${a}\n${b}`);
+    const now = new Date();
+    const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+
+    const headway = getYellowLineHeadway(nowSec);
+    if (!headway) {
+      return res.type("text").send("Hors période de service\n—");
+    }
+
+    // On affiche 2 “prochains” estimés par fréquence
+    const first = `≈ dans ${secondsToMinRange(headway)}`;
+    const second = `≈ dans ${Math.round(headway/60)}–${Math.round((2*headway)/60)} min`;
+
+    res.type("text").send(`${first}\n${second}`);
   } catch (e) {
-    console.error(e);
+    console.error("ERROR /next:", e);
     res.status(500).type("text").send("Données indisponibles\n—");
   }
 });
 
-// Page “panneau” simple (QR)
+// Page simple (utile pour QR)
 app.get("/panel", async (req, res) => {
-  const headway = getHeadwaySecondsForYellowLineNow();
-  const next = headway ? computeNextTwoFromHeadway(headway) : ["—", "—"];
-
+  const r = await fetch(`${req.protocol}://${req.get("host")}/next`);
+  const txt = await r.text();
+  const [a,b] = txt.split("\n");
   res.send(`
-  <html>
-    <head><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-    <body style="margin:0;background:black;color:#FFD200;font-family:Arial;padding:20px">
-      <div style="color:white;font-size:18px;margin-bottom:6px">MÉTRO – LONGUEUIL–UdeS</div>
-      <div style="color:#ddd;font-size:16px;margin-bottom:18px">Direction Berri-UQAM (théorique GTFS)</div>
-      <div style="display:flex;align-items:center;gap:10px;font-size:46px;margin-bottom:16px">
-        <span style="width:18px;height:18px;border-radius:50%;background:#FFD200;display:inline-block"></span>
-        <span>${next[0]}</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:10px;font-size:46px">
-        <span style="width:18px;height:18px;border-radius:50%;background:#FFD200;display:inline-block"></span>
-        <span>${next[1]}</span>
-      </div>
-      <div style="color:#aaa;font-size:12px;margin-top:18px">Source: GTFS planifié STM</div>
-    </body>
-  </html>
+    <html>
+      <body style="background:black;color:#FFD200;font-family:Arial;padding:20px">
+        <div style="color:white;margin-bottom:8px">MÉTRO — Ligne jaune</div>
+        <div style="color:white;margin-bottom:16px">Longueuil–UdeS → Berri-UQAM</div>
+        <div style="font-size:44px;margin:12px 0">● ${a || "-"}</div>
+        <div style="font-size:44px;margin:12px 0">● ${b || "-"}</div>
+      </body>
+    </html>
   `);
 });
 
-app.get("/", (req, res) => res.redirect("/panel"));
+app.get("/health", (req, res) => res.json({ ok: true, gtfsLoaded: !!GTFS }));
 
-(async () => {
-  try {
-    await loadGtfs();
-    app.listen(PORT, () => console.log("Serveur STM (GTFS théorique) lancé"));
-  } catch (e) {
-    console.error("Failed to start:", e);
-    // On démarre quand même (pour avoir une réponse claire)
-    app.listen(PORT, () => console.log("Serveur lancé mais GTFS indisponible"));
-  }
-})();
+downloadAndUnzipGTFS()
+  .then(() => console.log("Serveur STM (GTFS théorique – fréquence métro) lancé"))
+  .catch(err => console.error("GTFS init failed:", err));
+
+app.listen(PORT, () => console.log("Listening on", PORT));
