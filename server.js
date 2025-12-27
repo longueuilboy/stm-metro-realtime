@@ -1,314 +1,312 @@
-/**
- * STM Metro (théorique) — 2 prochains passages
- * - Sans clé API
- * - Télécharge le GTFS statique STM en ligne (ZIP)
- * - Calcule les départs métro via frequencies.txt (métro = fréquences dans le GTFS STM)
- *
- * Endpoints:
- *   GET /health  -> "ok"
- *   GET /next    -> texte 2 lignes ("Arrive\n6 min" ou "Hors période de service\n—")
- *   GET /panel   -> page HTML style panneau
- */
+// server.js — STM métro (horaire théorique) via GTFS frequencies.txt
+// Important: STM GTFS: bus schedules + metro frequency; metro is in frequencies.txt. :contentReference[oaicite:2]{index=2}
 
 const express = require("express");
 const fetch = require("node-fetch");
-const unzipper = require("unzipper");
-const csv = require("csv-parser");
+const fs = require("fs");
+const path = require("path");
+const yauzl = require("yauzl");
+const { parse } = require("csv-parse");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// URL stable du GTFS statique STM
-const GTFS_ZIP_URL =
-  process.env.GTFS_ZIP_URL || "https://www.stm.info/sites/default/files/gtfs/gtfs_stm.zip";
+// --- CONFIG ---
+const GTFS_URL =
+  process.env.GTFS_URL ||
+  "https://www.stm.info/sites/default/files/gtfs/gtfs_stm.zip"; // referenced as current static GTFS. :contentReference[oaicite:3]{index=3}
 
-// Paramètres pour ton cas
-const ROUTE_ID = "4";            // ligne jaune = 4 (souvent route_id "4" dans GTFS)
-const DIRECTION_ID = "0";        // direction vers Montréal (souvent 0/1)
-const TIMEZONE = "America/Toronto";
+const ROUTE_ID = process.env.METRO_ROUTE_ID || "4"; // Ligne jaune = 4 (dans le feed STM)
+const DIRECTION_ID = process.env.METRO_DIRECTION_ID || "0"; // parfois 0/1; si c’est inversé, change à "1"
 
-// Petite cache en mémoire (très légère)
-let cache = {
-  loadedAt: 0,
-  // services actifs pour aujourd'hui (set)
-  activeServiceIds: new Set(),
-  // trip_ids (ligne 4 + direction + service actif)
-  tripIds: new Set(),
-  // liste de blocs de fréquence pertinents [{startSec,endSec,headwaySec}]
-  freqBlocks: [],
-  // date YYYYMMDD pour laquelle le cache est calculé
-  ymd: "",
-};
+const CACHE_PATH = "/tmp/gtfs_stm.zip";
+const CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12h
 
-function torontoNowParts() {
-  // Extraire proprement date/heure à Toronto sans dépendance externe
-  const dtf = new Intl.DateTimeFormat("en-CA", {
-    timeZone: TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-    weekday: "short",
-  });
-
-  const parts = dtf.formatToParts(new Date());
-  const get = (type) => parts.find((p) => p.type === type)?.value;
-
-  const year = get("year");
-  const month = get("month");
-  const day = get("day");
-  const hour = get("hour");
-  const minute = get("minute");
-  const second = get("second");
-  const weekday = get("weekday"); // "Mon", "Tue", ...
-
-  const ymd = `${year}${month}${day}`; // YYYYMMDD
-  const secSinceMidnight = Number(hour) * 3600 + Number(minute) * 60 + Number(second);
-
-  return { ymd, weekday, secSinceMidnight };
+// --- Helpers: time ---
+function pad2(n) { return String(n).padStart(2, "0"); }
+function yyyymmdd(date) {
+  return `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}`;
+}
+function secondsSinceMidnight(date) {
+  return date.getHours() * 3600 + date.getMinutes() * 60 + date.getSeconds();
+}
+function parseHMS(hms) {
+  // GTFS peut dépasser 24:00:00, ex 25:10:00
+  const [h, m, s] = hms.split(":").map(Number);
+  return h * 3600 + m * 60 + s;
+}
+function formatNext(secFromNow) {
+  if (secFromNow <= 60) return "Arrive";
+  return `${Math.round(secFromNow / 60)} min`;
 }
 
-function weekdayToCalendarField(weekdayShort) {
-  // GTFS calendar.txt: monday..sunday (0/1)
-  const map = {
-    Mon: "monday",
-    Tue: "tuesday",
-    Wed: "wednesday",
-    Thu: "thursday",
-    Fri: "friday",
-    Sat: "saturday",
-    Sun: "sunday",
-  };
-  return map[weekdayShort] || "monday";
+// --- Download GTFS ZIP to disk (streaming) ---
+async function ensureGtfsZip() {
+  try {
+    const stat = fs.existsSync(CACHE_PATH) ? fs.statSync(CACHE_PATH) : null;
+    const fresh = stat && (Date.now() - stat.mtimeMs) < CACHE_MAX_AGE_MS;
+    if (fresh) return;
+
+    await new Promise(async (resolve, reject) => {
+      const resp = await fetch(GTFS_URL);
+      if (!resp.ok) return reject(new Error(`GTFS download failed: ${resp.status}`));
+      const file = fs.createWriteStream(CACHE_PATH);
+      resp.body.pipe(file);
+      resp.body.on("error", reject);
+      file.on("finish", () => file.close(resolve));
+      file.on("error", reject);
+    });
+  } catch (e) {
+    // If download fails but file exists, keep going with cached
+    if (!fs.existsSync(CACHE_PATH)) throw e;
+  }
 }
 
-function parseTimeToSec(t) {
-  // GTFS time peut dépasser 24:00:00, ex 25:12:00
-  // On accepte ça (secondes depuis minuit)
-  const [hh, mm, ss] = String(t).split(":").map(Number);
-  return hh * 3600 + mm * 60 + ss;
-}
-
-async function streamCsvFromZip(zipStream, filename, onRow) {
-  // Ouvre une entrée du zip et stream les lignes CSV
-  const directory = await unzipper.Open.stream(zipStream);
-  const file = directory.files.find((f) => f.path.toLowerCase() === filename.toLowerCase());
-  if (!file) throw new Error(`Fichier manquant dans GTFS: ${filename}`);
-
+// --- Read a specific file inside the ZIP as a stream ---
+function openZipEntryStream(zipPath, wantedName) {
   return new Promise((resolve, reject) => {
-    file
-      .stream()
-      .pipe(csv())
-      .on("data", onRow)
+    yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
+      if (err) return reject(err);
+      zipfile.readEntry();
+
+      zipfile.on("entry", (entry) => {
+        const name = entry.fileName.toLowerCase();
+        if (name === wantedName.toLowerCase()) {
+          zipfile.openReadStream(entry, (err2, stream) => {
+            if (err2) return reject(err2);
+            // close zipfile when stream ends
+            stream.on("end", () => zipfile.close());
+            return resolve(stream);
+          });
+        } else {
+          zipfile.readEntry();
+        }
+      });
+
+      zipfile.on("end", () => reject(new Error(`File not found in ZIP: ${wantedName}`)));
+      zipfile.on("error", reject);
+    });
+  });
+}
+
+// --- Parse calendar + calendar_dates to know active service_ids today ---
+async function loadServiceIdsForToday(dateObj) {
+  const today = yyyymmdd(dateObj);
+  const dow = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"][dateObj.getDay()];
+
+  const calendar = new Map(); // service_id -> {start_date,end_date, dowFlags}
+  const exceptions = new Map(); // service_id -> exception_type (for today)
+
+  // calendar.txt
+  {
+    const stream = await openZipEntryStream(CACHE_PATH, "calendar.txt");
+    await new Promise((resolve, reject) => {
+      stream
+        .pipe(parse({ columns: true, relax_quotes: true, trim: true }))
+        .on("data", (r) => {
+          calendar.set(r.service_id, {
+            start: r.start_date,
+            end: r.end_date,
+            monday: r.monday, tuesday: r.tuesday, wednesday: r.wednesday,
+            thursday: r.thursday, friday: r.friday, saturday: r.saturday, sunday: r.sunday
+          });
+        })
+        .on("end", resolve)
+        .on("error", reject);
+    });
+  }
+
+  // calendar_dates.txt (exceptions)
+  {
+    const stream = await openZipEntryStream(CACHE_PATH, "calendar_dates.txt");
+    await new Promise((resolve, reject) => {
+      stream
+        .pipe(parse({ columns: true, relax_quotes: true, trim: true }))
+        .on("data", (r) => {
+          if (r.date === today) exceptions.set(r.service_id, r.exception_type);
+        })
+        .on("end", resolve)
+        .on("error", reject);
+    });
+  }
+
+  const active = new Set();
+  for (const [serviceId, info] of calendar.entries()) {
+    if (!(info.start <= today && today <= info.end)) continue;
+
+    const dowOk = String(info[dow]) === "1";
+    const ex = exceptions.get(serviceId);
+
+    // exception_type: 1 = add, 2 = remove
+    if (ex === "2") continue;
+    if (ex === "1") { active.add(serviceId); continue; }
+
+    if (dowOk) active.add(serviceId);
+  }
+
+  return active;
+}
+
+// --- Load trip_ids for route 4 + direction ---
+async function loadTripIdsForRouteAndDirection() {
+  const tripIds = new Map(); // trip_id -> service_id (only for our route/direction)
+
+  const stream = await openZipEntryStream(CACHE_PATH, "trips.txt");
+  await new Promise((resolve, reject) => {
+    stream
+      .pipe(parse({ columns: true, relax_quotes: true, trim: true }))
+      .on("data", (r) => {
+        // route_id, service_id, trip_id, direction_id
+        if (String(r.route_id) !== String(ROUTE_ID)) return;
+        if (String(r.direction_id ?? "") !== String(DIRECTION_ID)) return;
+        tripIds.set(r.trip_id, r.service_id);
+      })
       .on("end", resolve)
       .on("error", reject);
   });
+
+  return tripIds;
 }
 
-async function downloadGtfsZipStream() {
-  const resp = await fetch(GTFS_ZIP_URL, { timeout: 20000 });
-  if (!resp.ok) throw new Error(`GTFS download failed: ${resp.status}`);
-  return resp.body; // stream
+// --- Load frequency windows for active service_ids ---
+async function loadFrequencyWindows(activeServiceIds, tripIdsMap) {
+  const windows = []; // {startSec,endSec,headwaySec}
+
+  const stream = await openZipEntryStream(CACHE_PATH, "frequencies.txt");
+  await new Promise((resolve, reject) => {
+    stream
+      .pipe(parse({ columns: true, relax_quotes: true, trim: true }))
+      .on("data", (r) => {
+        const tripId = r.trip_id;
+        const serviceId = tripIdsMap.get(tripId);
+        if (!serviceId) return;
+        if (!activeServiceIds.has(serviceId)) return;
+
+        const startSec = parseHMS(r.start_time);
+        const endSec = parseHMS(r.end_time);
+        const headwaySec = Number(r.headway_secs);
+
+        if (!Number.isFinite(headwaySec) || headwaySec <= 0) return;
+        windows.push({ startSec, endSec, headwaySec });
+      })
+      .on("end", resolve)
+      .on("error", reject);
+  });
+
+  // Sort by start time
+  windows.sort((a, b) => a.startSec - b.startSec);
+  return windows;
 }
 
-async function rebuildCacheIfNeeded() {
-  const { ymd, weekday } = torontoNowParts();
-  const cacheFresh = cache.ymd === ymd && (Date.now() - cache.loadedAt) < 6 * 60 * 60 * 1000; // 6h
-  if (cacheFresh) return;
-
-  // Reset cache
-  cache = {
-    loadedAt: Date.now(),
-    activeServiceIds: new Set(),
-    tripIds: new Set(),
-    freqBlocks: [],
-    ymd,
-  };
-
-  const weekdayField = weekdayToCalendarField(weekday);
-
-  // Télécharge une fois, puis on re-télécharge pour chaque fichier (simple + robuste en streaming)
-  // (On évite de stocker le zip entier en RAM)
-  // 1) calendar.txt -> services actifs selon la date + jour de semaine
-  {
-    const zipStream = await downloadGtfsZipStream();
-    await streamCsvFromZip(zipStream, "calendar.txt", (row) => {
-      // calendar.txt: service_id, monday..sunday, start_date, end_date
-      if (!row.service_id) return;
-      const inRange = row.start_date <= ymd && ymd <= row.end_date;
-      const runsToday = row[weekdayField] === "1";
-      if (inRange && runsToday) cache.activeServiceIds.add(row.service_id);
-    });
-  }
-
-  // 2) calendar_dates.txt -> exceptions (add/remove)
-  {
-    const zipStream = await downloadGtfsZipStream();
-    await streamCsvFromZip(zipStream, "calendar_dates.txt", (row) => {
-      // exception_type: 1=added, 2=removed
-      if (row.date !== ymd) return;
-      if (row.exception_type === "1") cache.activeServiceIds.add(row.service_id);
-      if (row.exception_type === "2") cache.activeServiceIds.delete(row.service_id);
-    });
-  }
-
-  // 3) trips.txt -> trip_ids route=4, direction=0, service_id actif
-  // On garde un set de trip_ids pertinents (faible pour une seule ligne)
-  {
-    const zipStream = await downloadGtfsZipStream();
-    await streamCsvFromZip(zipStream, "trips.txt", (row) => {
-      if (!row.trip_id || !row.route_id || !row.service_id) return;
-      if (row.route_id !== ROUTE_ID) return;
-      if (String(row.direction_id ?? "") !== DIRECTION_ID) return;
-      if (!cache.activeServiceIds.has(row.service_id)) return;
-      cache.tripIds.add(row.trip_id);
-    });
-  }
-
-  // 4) frequencies.txt -> blocs de fréquence pour ces trip_ids
-  // frequencies.txt: trip_id,start_time,end_time,headway_secs,exact_times
-  {
-    const zipStream = await downloadGtfsZipStream();
-    await streamCsvFromZip(zipStream, "frequencies.txt", (row) => {
-      if (!row.trip_id || !row.start_time || !row.end_time || !row.headway_secs) return;
-      if (!cache.tripIds.has(row.trip_id)) return;
-
-      const startSec = parseTimeToSec(row.start_time);
-      const endSec = parseTimeToSec(row.end_time);
-      const headwaySec = Number(row.headway_secs);
-
-      if (Number.isFinite(startSec) && Number.isFinite(endSec) && Number.isFinite(headwaySec) && headwaySec > 0) {
-        cache.freqBlocks.push({ startSec, endSec, headwaySec });
-      }
-    });
-  }
-
-  // Si aucun bloc, on ne pourra rien afficher
-  cache.freqBlocks.sort((a, b) => a.startSec - b.startSec);
-}
-
-function computeNextTwoDepartures() {
-  const { secSinceMidnight } = torontoNowParts();
-
+// --- Compute next 2 departures from "now" based on frequency windows ---
+function nextTwoFromFrequencies(nowSec, windows) {
   const candidates = [];
-  for (const b of cache.freqBlocks) {
-    // Si on est avant la fenêtre
-    if (secSinceMidnight <= b.startSec) {
-      candidates.push(b.startSec);
-      continue;
-    }
-    // Si on est après la fenêtre
-    if (secSinceMidnight > b.endSec) continue;
 
-    // On est dans la fenêtre: prochain départ = start + ceil((now-start)/headway)*headway
-    const k = Math.ceil((secSinceMidnight - b.startSec) / b.headwaySec);
-    const next = b.startSec + k * b.headwaySec;
-    if (next <= b.endSec) candidates.push(next);
+  for (const w of windows) {
+    if (nowSec > w.endSec) continue;
+
+    const start = w.startSec;
+    const head = w.headwaySec;
+
+    // If before service window, next is at start
+    let next = nowSec <= start ? start : start + Math.ceil((nowSec - start) / head) * head;
+
+    // produce up to 2 within this window
+    for (let i = 0; i < 2; i++) {
+      const t = next + i * head;
+      if (t <= w.endSec) candidates.push(t);
+    }
   }
 
   candidates.sort((a, b) => a - b);
-
-  // On prend les 2 plus proches, et si le 2e manque, on essaie le suivant à +headway
-  const nextTwo = [];
-  for (let i = 0; i < candidates.length && nextTwo.length < 2; i++) {
-    const t = candidates[i];
-    if (!nextTwo.includes(t)) nextTwo.push(t);
+  // unique & keep first two
+  const uniq = [];
+  for (const t of candidates) {
+    if (uniq.length && uniq[uniq.length - 1] === t) continue;
+    uniq.push(t);
+    if (uniq.length >= 2) break;
   }
-
-  // Si on n'a qu'un seul, on tente de générer un second à partir du même bloc (approx)
-  if (nextTwo.length === 1) {
-    // essaye le +headway à partir d'un bloc qui contient ce temps
-    const t1 = nextTwo[0];
-    const block = cache.freqBlocks.find((b) => t1 >= b.startSec && t1 <= b.endSec);
-    if (block) {
-      const t2 = t1 + block.headwaySec;
-      if (t2 <= block.endSec) nextTwo.push(t2);
-    }
-  }
-
-  return nextTwo;
+  return uniq;
 }
 
-function formatAsArriveOrMinutes(departSec) {
-  const { secSinceMidnight } = torontoNowParts();
-  const delta = departSec - secSinceMidnight;
-  if (delta <= 60) return "Arrive";
-  const mins = Math.round(delta / 60);
-  return `${mins} min`;
+// --- Main: get next two as text ---
+async function getNextTwoText() {
+  await ensureGtfsZip();
+
+  const now = new Date();
+  const nowSec = secondsSinceMidnight(now);
+
+  const activeServices = await loadServiceIdsForToday(now);
+  const tripIdsMap = await loadTripIdsForRouteAndDirection();
+  const windows = await loadFrequencyWindows(activeServices, tripIdsMap);
+
+  if (!windows.length) {
+    return { status: "Hors période de service", lines: ["Hors période de service", "—"] };
+  }
+
+  const nextTimes = nextTwoFromFrequencies(nowSec, windows);
+
+  if (!nextTimes.length) {
+    return { status: "Hors période de service", lines: ["Hors période de service", "—"] };
+  }
+
+  const lines = nextTimes.map(t => formatNext(t - nowSec));
+  if (lines.length === 1) lines.push("—");
+  return { status: "OK", lines };
 }
 
-// Healthcheck utile pour Render
-app.get("/health", (req, res) => res.type("text").send("ok"));
+// --- Routes ---
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.get("/next", async (req, res) => {
   try {
-    await rebuildCacheIfNeeded();
-
-    const nextTimes = computeNextTwoDepartures();
-
-    if (!nextTimes.length) {
-      return res.type("text").send("Hors période de service\n—");
-    }
-
-    const line1 = formatAsArriveOrMinutes(nextTimes[0]);
-    const line2 = nextTimes[1] ? formatAsArriveOrMinutes(nextTimes[1]) : "—";
-    res.type("text").send(`${line1}\n${line2}`);
+    const out = await getNextTwoText();
+    res.type("text/plain").send(out.lines.join("\n"));
   } catch (e) {
     console.error(e);
-    res.status(500).type("text").send("Données indisponibles\n—");
+    res.status(500).type("text/plain").send("Données indisponibles\n—");
   }
 });
 
 app.get("/panel", async (req, res) => {
-  let l1 = "—", l2 = "—";
   try {
-    await rebuildCacheIfNeeded();
-    const nextTimes = computeNextTwoDepartures();
-    if (!nextTimes.length) {
-      l1 = "Hors période de service";
-      l2 = "—";
-    } else {
-      l1 = formatAsArriveOrMinutes(nextTimes[0]);
-      l2 = nextTimes[1] ? formatAsArriveOrMinutes(nextTimes[1]) : "—";
-    }
-  } catch {
-    l1 = "Données indisponibles";
-    l2 = "—";
-  }
+    const out = await getNextTwoText();
+    const l1 = out.lines[0] || "—";
+    const l2 = out.lines[1] || "—";
 
-  res.send(`<!doctype html>
+    // NOTE: This is theoretical (frequency-based), not real-time.
+    res.send(`<!doctype html>
 <html lang="fr">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Métro – Ligne jaune</title>
+<title>Métro — Ligne jaune</title>
 <style>
   body{margin:0;background:#000;color:#FFD200;font-family:Arial,Helvetica,sans-serif}
-  .wrap{padding:18px}
-  .h{font-size:20px;font-weight:700;margin-bottom:6px}
+  .wrap{padding:20px}
+  .h{color:#FFD200;font-weight:700;font-size:18px;margin-bottom:6px}
   .sub{color:#fff;font-size:16px;margin-bottom:18px}
-  .row{display:flex;align-items:center;gap:10px;font-size:44px;margin:14px 0}
-  .rt{width:18px;height:18px;border-radius:50%;background:#FFD200;animation:pulse 1.5s infinite}
-  @keyframes pulse{0%{opacity:1}50%{opacity:.35}100%{opacity:1}}
-  .foot{color:#fff;font-size:12px;margin-top:18px;opacity:.85}
+  .row{display:flex;align-items:center;gap:10px;font-size:44px;margin:10px 0}
+  .dot{width:18px;height:18px;border-radius:50%;background:#FFD200;opacity:.9}
+  .foot{color:#fff;opacity:.8;font-size:13px;margin-top:18px}
 </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="h">MÉTRO – LONGUEUIL–UdeS</div>
-    <div class="sub">Direction Berri-UQAM (horaire théorique)</div>
-    <div class="row"><span class="rt"></span><span>${l1}</span></div>
-    <div class="row"><span class="rt"></span><span>${l2}</span></div>
-    <div class="foot">Source: GTFS statique STM (${cache.ymd})</div>
+    <div class="h">MÉTRO — LIGNE JAUNE</div>
+    <div class="sub">Longueuil–UdeS → Berri-UQAM (horaire planifié)</div>
+
+    <div class="row"><div class="dot"></div><div>${l1}</div></div>
+    <div class="row"><div class="dot"></div><div>${l2}</div></div>
+
+    <div class="foot">Source: GTFS STM (frequencies) — pas du temps réel</div>
   </div>
 </body>
 </html>`);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send("Données indisponibles");
+  }
 });
 
-app.listen(PORT, () => {
-  console.log("Serveur STM (GTFS théorique) lancé");
-  console.log("GTFS ZIP:", GTFS_ZIP_URL);
-});
+app.listen(PORT, () => console.log("Serveur STM (GTFS théorique) lancé"));
