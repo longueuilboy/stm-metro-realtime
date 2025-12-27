@@ -1,182 +1,365 @@
+// server.js — STM GTFS (théorique) : 2 prochains passages métro (ligne 4) à STOP_ID
+//
+// Dépendances requises dans package.json:
+//   express, node-fetch (v2), unzipper, csv-parse
+//
+// Variables d'environnement conseillées (Render > Environment):
+//   STOP_ID=STATION_M454
+//   ROUTE_SHORT_NAME=4
+//   GTFS_ZIP_URL=https://www.stm.info/sites/default/files/gtfs/gtfs_stm.zip
+//   TZ=America/Toronto
+//
+// Endpoints:
+//   GET /health  -> OK
+//   GET /next    -> texte (2 lignes) : "Arrive\n6 min" ou "Hors période de service\n—"
+//   GET /panel   -> page web style panneau simple
+
 const express = require("express");
-const fetch = require("node-fetch");
+const fetch = require("node-fetch"); // v2
 const unzipper = require("unzipper");
 const fs = require("fs");
 const path = require("path");
-const { DateTime } = require("luxon");
-const TZ = "America/Toronto";
-
+const { parse } = require("csv-parse/sync");
 
 const app = express();
-app.get("/health", (req, res) => {
-  res.status(200).send("ok");
-});
-
 const PORT = process.env.PORT || 3000;
 
-// GTFS STM officiel (statique)
-const GTFS_ZIP_URL = "http://www.stm.info/sites/default/files/gtfs/gtfs_stm.zip"; // :contentReference[oaicite:2]{index=2}
+const GTFS_ZIP_URL =
+  process.env.GTFS_ZIP_URL ||
+  "https://www.stm.info/sites/default/files/gtfs/gtfs_stm.zip";
 
-// Dossier de travail sur Render
-const GTFS_DIR = "/tmp/gtfs_stm";
+const STOP_ID = process.env.STOP_ID || "STATION_M454";
+const ROUTE_SHORT_NAME = process.env.ROUTE_SHORT_NAME || "4";
 
-// Helpers CSV
-function parseCSV(filePath) {
-  const txt = fs.readFileSync(filePath, "utf8");
-  const lines = txt.split(/\r?\n/).filter(Boolean);
-  const headers = lines.shift().split(",");
-  return lines.map(line => {
-    // simple split CSV (ok for STM GTFS in practice for these files)
-    const cols = line.split(",");
-    const obj = {};
-    headers.forEach((h, i) => (obj[h] = cols[i]));
-    return obj;
+// Cache en mémoire (chargé au démarrage)
+let GTFS = {
+  loadedAt: null,
+  routesById: new Map(),       // route_id -> route record
+  tripsById: new Map(),        // trip_id -> {route_id, service_id}
+  // Pour le stop visé : liste de départs théoriques par (service_id) avec heure (sec depuis minuit)
+  // Map service_id -> [ { depSec, trip_id } ... ] triés
+  departuresByService: new Map(),
+  calendar: [],                // calendar.txt rows
+  calendarDates: [],           // calendar_dates.txt rows
+};
+
+// --------- helpers temps / date (timezone safe sans lib externe) ----------
+function getLocalPartsToronto(date = new Date()) {
+  // Utilise l'API Intl pour produire les "parts" dans le fuseau Toronto (même que Montréal)
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Toronto",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
   });
+  const parts = fmt.formatToParts(date);
+  const obj = {};
+  for (const p of parts) obj[p.type] = p.value;
+  // weekday: Mon/Tue...
+  return {
+    yyyy: obj.year,
+    mm: obj.month,
+    dd: obj.day,
+    weekday: obj.weekday, // Mon Tue Wed Thu Fri Sat Sun
+    hh: obj.hour,
+    min: obj.minute,
+    ss: obj.second,
+  };
 }
 
-function hmsToSeconds(hms) {
-  const [h, m, s] = hms.split(":").map(Number);
-  return (h * 3600) + (m * 60) + (s || 0);
+function yyyymmddToronto(date = new Date()) {
+  const p = getLocalPartsToronto(date);
+  return `${p.yyyy}${p.mm}${p.dd}`; // ex: 20251227
 }
 
-function secondsToMinRange(headwaySec) {
-  const m = Math.max(1, Math.round(headwaySec / 60));
-  return `0–${m} min`;
+function secondsSinceMidnightToronto(date = new Date()) {
+  const p = getLocalPartsToronto(date);
+  const h = Number(p.hh);
+  const m = Number(p.min);
+  const s = Number(p.ss);
+  return h * 3600 + m * 60 + s;
 }
 
-// ---- GTFS load (download + unzip) ----
-let GTFS = null;
+function weekdayKeyToronto(date = new Date()) {
+  // calendar.txt uses monday/tuesday/... flags
+  const wk = getLocalPartsToronto(date).weekday;
+  const map = {
+    Mon: "monday",
+    Tue: "tuesday",
+    Wed: "wednesday",
+    Thu: "thursday",
+    Fri: "friday",
+    Sat: "saturday",
+    Sun: "sunday",
+  };
+  return map[wk] || "monday";
+}
 
-async function downloadAndUnzipGTFS() {
-  fs.mkdirSync(GTFS_DIR, { recursive: true });
+function parseGtfsTimeToSeconds(t) {
+  // GTFS times can be > 24:00:00 (ex 25:10:00)
+  // We'll allow it by converting directly.
+  if (!t || typeof t !== "string") return null;
+  const [hh, mm, ss] = t.split(":").map((x) => Number(x));
+  if ([hh, mm, ss].some((n) => Number.isNaN(n))) return null;
+  return hh * 3600 + mm * 60 + ss;
+}
 
-  const zipPath = path.join(GTFS_DIR, "gtfs_stm.zip");
-  const res = await fetch(GTFS_ZIP_URL);
-  if (!res.ok) throw new Error("Download GTFS failed: " + res.status);
+function formatDeltaToLabel(deltaSec) {
+  if (deltaSec < 60) return "Arrive";
+  const mins = Math.round(deltaSec / 60);
+  return `${mins} min`;
+}
 
-  const fileStream = fs.createWriteStream(zipPath);
+// --------- GTFS load ----------
+async function downloadAndExtractGtfsZip(destDir) {
+  // download zip to buffer then extract
+  const resp = await fetch(GTFS_ZIP_URL, { timeout: 30000 });
+  if (!resp.ok) {
+    throw new Error(`GTFS zip fetch failed: ${resp.status}`);
+  }
+
+  await fs.promises.mkdir(destDir, { recursive: true });
+
+  // Stream unzip to files (no need to keep whole zip)
   await new Promise((resolve, reject) => {
-    res.body.pipe(fileStream);
-    res.body.on("error", reject);
-    fileStream.on("finish", resolve);
-  });
-
-  // unzip
-  await fs.createReadStream(zipPath)
-    .pipe(unzipper.Extract({ path: GTFS_DIR }))
-    .promise();
-
-  // Load only what we need
-  const routes = parseCSV(path.join(GTFS_DIR, "routes.txt"));
-  const trips = parseCSV(path.join(GTFS_DIR, "trips.txt"));
-  const frequencies = fs.existsSync(path.join(GTFS_DIR, "frequencies.txt"))
-    ? parseCSV(path.join(GTFS_DIR, "frequencies.txt"))
-    : [];
-  const calendar = fs.existsSync(path.join(GTFS_DIR, "calendar.txt"))
-    ? parseCSV(path.join(GTFS_DIR, "calendar.txt"))
-    : [];
-
-  GTFS = { routes, trips, frequencies, calendar };
-  console.log("GTFS loaded:", {
-    routes: routes.length,
-    trips: trips.length,
-    frequencies: frequencies.length
+    resp.body
+      .pipe(unzipper.Extract({ path: destDir }))
+      .on("close", resolve)
+      .on("error", reject);
   });
 }
 
-// Determine active service_id today (very simple)
-function getTodayServiceIds(calendar) {
-  // Render is UTC by default; set TZ in Render to America/Toronto (see step 2)
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  const yyyymmdd = `${y}${m}${d}`;
-
-  const weekday = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"][now.getDay()];
-
-  return calendar
-    .filter(r => r.start_date <= yyyymmdd && r.end_date >= yyyymmdd && r[weekday] === "1")
-    .map(r => r.service_id);
+function readCsv(filePath) {
+  const raw = fs.readFileSync(filePath, "utf8");
+  return parse(raw, {
+    columns: true,
+    skip_empty_lines: true,
+  });
 }
 
-// Find headway for line 4 around now using frequencies.txt
-function getYellowLineHeadway(nowSec) {
-  if (!GTFS) throw new Error("GTFS not loaded yet");
+function buildIndexesFromGtfsDir(dir) {
+  const routesPath = path.join(dir, "routes.txt");
+  const tripsPath = path.join(dir, "trips.txt");
+  const stopTimesPath = path.join(dir, "stop_times.txt");
+  const calendarPath = path.join(dir, "calendar.txt");
+  const calendarDatesPath = path.join(dir, "calendar_dates.txt");
 
-  const serviceIds = getTodayServiceIds(GTFS.calendar);
+  const routes = readCsv(routesPath);
+  const trips = readCsv(tripsPath);
+  const calendar = fs.existsSync(calendarPath) ? readCsv(calendarPath) : [];
+  const calendarDates = fs.existsSync(calendarDatesPath)
+    ? readCsv(calendarDatesPath)
+    : [];
 
-  // route_id "4" (ligne jaune) — on prend les trips route_id=4 et service_id actif
-  const tripIds = new Set(
-    GTFS.trips
-      .filter(t => t.route_id === "4" && serviceIds.includes(t.service_id))
-      .map(t => t.trip_id)
+  const routesById = new Map();
+  for (const r of routes) routesById.set(String(r.route_id), r);
+
+  // route filter: metro line 4 by route_short_name == "4"
+  const wantedRouteIds = new Set(
+    routes
+      .filter((r) => String(r.route_short_name || "").trim() === String(ROUTE_SHORT_NAME))
+      .map((r) => String(r.route_id))
   );
 
-  // Find frequencies rows matching these trips and current time window
-  const matches = GTFS.frequencies
-    .filter(f => tripIds.has(f.trip_id))
-    .map(f => ({
-      start: hmsToSeconds(f.start_time),
-      end: hmsToSeconds(f.end_time),
-      headway: Number(f.headway_secs)
-    }))
-    .filter(f => nowSec >= f.start && nowSec <= f.end);
+  const tripsById = new Map();
+  for (const t of trips) {
+    const tripId = String(t.trip_id);
+    const routeId = String(t.route_id);
+    if (!wantedRouteIds.has(routeId)) continue;
+    tripsById.set(tripId, { route_id: routeId, service_id: String(t.service_id) });
+  }
 
-  if (!matches.length) return null;
+  // Build departures at the stop for those trips
+  // We'll scan stop_times and keep only lines where stop_id matches AND trip_id is in tripsById
+  const departuresByService = new Map();
 
-  // Use the smallest headway (best case)
-  matches.sort((a, b) => a.headway - b.headway);
-  return matches[0].headway;
+  // stop_times is big; read+parse is simplest. Render free tier can handle once at boot.
+  const stopTimes = readCsv(stopTimesPath);
+
+  for (const st of stopTimes) {
+    if (String(st.stop_id) !== String(STOP_ID)) continue;
+    const tripId = String(st.trip_id);
+    const trip = tripsById.get(tripId);
+    if (!trip) continue;
+
+    // prefer departure_time if present, else arrival_time
+    const depTime = st.departure_time || st.arrival_time;
+    const depSec = parseGtfsTimeToSeconds(depTime);
+    if (depSec == null) continue;
+
+    const sid = trip.service_id;
+    if (!departuresByService.has(sid)) departuresByService.set(sid, []);
+    departuresByService.get(sid).push({ depSec, trip_id: tripId });
+  }
+
+  // Sort each service list
+  for (const [sid, list] of departuresByService.entries()) {
+    list.sort((a, b) => a.depSec - b.depSec);
+  }
+
+  GTFS.routesById = routesById;
+  GTFS.tripsById = tripsById;
+  GTFS.departuresByService = departuresByService;
+  GTFS.calendar = calendar;
+  GTFS.calendarDates = calendarDates;
+  GTFS.loadedAt = new Date().toISOString();
+
+  console.log("GTFS loaded:", {
+    routes: routes.length,
+    tripsFiltered: tripsById.size,
+    stopId: STOP_ID,
+    routeShortName: ROUTE_SHORT_NAME,
+  });
 }
 
-// ---- endpoints ----
-app.get("/next", async (req, res) => {
-  try {
-    if (!GTFS) {
-      return res.status(503).type("text").send("Données indisponibles\n—");
+function activeServiceIdsForToday() {
+  const today = yyyymmddToronto(new Date());
+  const weekdayKey = weekdayKeyToronto(new Date());
+
+  const active = new Set();
+
+  // 1) calendar.txt (regular schedule)
+  for (const c of GTFS.calendar) {
+    const start = String(c.start_date);
+    const end = String(c.end_date);
+    if (today < start || today > end) continue;
+    if (String(c[weekdayKey]) !== "1") continue;
+    active.add(String(c.service_id));
+  }
+
+  // 2) calendar_dates.txt exceptions
+  // exception_type=1 add, exception_type=2 remove
+  for (const cd of GTFS.calendarDates) {
+    if (String(cd.date) !== today) continue;
+    const sid = String(cd.service_id);
+    const ex = String(cd.exception_type);
+    if (ex === "1") active.add(sid);
+    if (ex === "2") active.delete(sid);
+  }
+
+  return active;
+}
+
+function nextTwoDepartures() {
+  const nowSec = secondsSinceMidnightToronto(new Date());
+  const activeServices = activeServiceIdsForToday();
+
+  // Collect candidates from active services
+  const candidates = [];
+
+  for (const sid of activeServices) {
+    const list = GTFS.departuresByService.get(sid);
+    if (!list || list.length === 0) continue;
+
+    // Find first departure after nowSec (binary search)
+    let lo = 0, hi = list.length - 1, idx = list.length;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (list[mid].depSec >= nowSec) {
+        idx = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
     }
 
-    const now = new Date();
-    const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+    for (let i = idx; i < Math.min(idx + 6, list.length); i++) {
+      candidates.push(list[i].depSec);
+    }
+  }
 
-    const headway = getYellowLineHeadway(nowSec);
-    if (!headway) {
+  candidates.sort((a, b) => a - b);
+
+  // take first 2 unique-ish (sometimes duplicates across services)
+  const uniq = [];
+  for (const c of candidates) {
+    if (uniq.length === 0 || Math.abs(c - uniq[uniq.length - 1]) > 10) uniq.push(c);
+    if (uniq.length >= 2) break;
+  }
+
+  if (uniq.length === 0) return null;
+
+  // delta seconds from now
+  const deltas = uniq.map((depSec) => Math.max(0, depSec - nowSec));
+  return deltas;
+}
+
+// --------- routes ----------
+app.get("/health", (req, res) => res.status(200).type("text").send("OK"));
+
+app.get("/next", (req, res) => {
+  try {
+    const deltas = nextTwoDepartures();
+
+    if (!deltas || deltas.length === 0) {
       return res.type("text").send("Hors période de service\n—");
     }
 
-    // On affiche 2 “prochains” estimés par fréquence
-    const first = `≈ dans ${secondsToMinRange(headway)}`;
-    const second = `≈ dans ${Math.round(headway/60)}–${Math.round((2*headway)/60)} min`;
-
-    res.type("text").send(`${first}\n${second}`);
+    const line1 = formatDeltaToLabel(deltas[0]);
+    const line2 = deltas[1] != null ? formatDeltaToLabel(deltas[1]) : "—";
+    return res.type("text").send(`${line1}\n${line2}`);
   } catch (e) {
-    console.error("ERROR /next:", e);
-    res.status(500).type("text").send("Données indisponibles\n—");
+    console.error(e);
+    return res.status(500).type("text").send("Données indisponibles\n—");
   }
 });
 
-// Page simple (utile pour QR)
-app.get("/panel", async (req, res) => {
-  const r = await fetch(`${req.protocol}://${req.get("host")}/next`);
-  const txt = await r.text();
-  const [a,b] = txt.split("\n");
-  res.send(`
-    <html>
-      <body style="background:black;color:#FFD200;font-family:Arial;padding:20px">
-        <div style="color:white;margin-bottom:8px">MÉTRO — Ligne jaune</div>
-        <div style="color:white;margin-bottom:16px">Longueuil–UdeS → Berri-UQAM</div>
-        <div style="font-size:44px;margin:12px 0">● ${a || "-"}</div>
-        <div style="font-size:44px;margin:12px 0">● ${b || "-"}</div>
-      </body>
-    </html>
-  `);
+app.get("/panel", (req, res) => {
+  const deltas = nextTwoDepartures();
+  const l1 = deltas && deltas[0] != null ? formatDeltaToLabel(deltas[0]) : "—";
+  const l2 = deltas && deltas[1] != null ? formatDeltaToLabel(deltas[1]) : "—";
+  res.send(`<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Métro — Longueuil</title>
+<style>
+  body{margin:0;background:#000;color:#FFD200;font-family:Arial,Helvetica,sans-serif}
+  .wrap{padding:18px}
+  .h1{font-size:20px;font-weight:700;margin-bottom:6px}
+  .sub{color:#fff;opacity:.9;margin-bottom:18px}
+  .row{display:flex;align-items:center;gap:10px;font-size:44px;margin:14px 0}
+  .rt{width:18px;height:18px;border-radius:50%;background:#FFD200;animation:pulse 1.4s infinite}
+  @keyframes pulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}
+  .foot{color:#fff;opacity:.8;margin-top:18px;font-size:13px}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="h1">MÉTRO — LONGUEUIL–UdeS</div>
+    <div class="sub">Direction Berri-UQAM (horaire théorique)</div>
+
+    <div class="row"><span class="rt"></span><span>${l1}</span></div>
+    <div class="row"><span class="rt"></span><span>${l2}</span></div>
+
+    <div class="foot">STOP_ID: ${STOP_ID} • GTFS chargé: ${GTFS.loadedAt || "—"}</div>
+  </div>
+</body>
+</html>`);
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, gtfsLoaded: !!GTFS }));
+// --------- bootstrap ----------
+async function boot() {
+  const workDir = "/tmp/gtfs_stm";
+  try {
+    console.log("Downloading GTFS zip from:", GTFS_ZIP_URL);
+    await downloadAndExtractGtfsZip(workDir);
+    buildIndexesFromGtfsDir(workDir);
+    console.log("Serveur STM (GTFS théorique) lancé");
+  } catch (e) {
+    console.error("GTFS boot failed:", e);
+    // We still start server so /health responds and /next returns "Données indisponibles"
+  }
 
-downloadAndUnzipGTFS()
-  .then(() => console.log("Serveur STM (GTFS théorique – fréquence métro) lancé"))
-  .catch(err => console.error("GTFS init failed:", err));
+  app.listen(PORT, () => {
+    console.log("Listening on", PORT);
+  });
+}
 
-app.listen(PORT, () => console.log("Listening on", PORT));
+boot();
