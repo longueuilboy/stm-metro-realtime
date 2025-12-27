@@ -5,6 +5,10 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
+app.get("/health", (req, res) => {
+  res.status(200).send("ok");
+});
+
 const PORT = process.env.PORT || 3000;
 
 // GTFS STM officiel (statique)
