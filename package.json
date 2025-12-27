@@ -1,12 +1,15 @@
 {
-  "name": "stm-metro-theorique",
+  "name": "stm-metro-realtime",
   "version": "1.0.0",
+  "description": "Prochains métros STM (horaire théorique basé sur GTFS frequencies)",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "express": "^4.19.2",
     "node-fetch": "^2.7.0",
-    "unzipper": "^0.10.14",
-    "csv-parser": "^3.0.0"
+    "yauzl": "^2.10.0",
+    "csv-parse": "^5.5.6"
   }
 }
